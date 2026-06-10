@@ -96,10 +96,11 @@ TOC_LINE = re.compile(r"\.{4,}\s*\d{1,3}\s*$|\s\d{1,3}\s*$")
 # 章節結束邊界：受益所有權章節之後的下一個大章節標題，掃到就停止合併
 STOP_HEADING = re.compile(
     r"^(?:executive compensation|election of directors|compensation discussion"
-    r"|summary compensation|section\s*16|audit committee|certain relationships"
-    r"|transactions with|equity compensation plan|report of (?:the )?(?:audit|compensation)"
-    r"|proposal\s*\d|ratification|corporate governance|director compensation"
-    r"|nominees|other matters)", re.I)
+    r"|summary compensation|section\s*16|delinquent section|audit committee"
+    r"|certain relationships|transactions with|equity compensation plan"
+    r"|report of (?:the )?(?:audit|compensation)|proposal\s*\d|ratification"
+    r"|corporate governance|director compensation|nominees|other matters"
+    r"|delinquent\s+(?:section|filings))", re.I)
 
 # 表頭錨點（內容錨點用）：含「Beneficially Owned」字樣的表頭
 HEADER_ANCHOR = re.compile(r"beneficially owned|amount and nature of beneficial", re.I)
@@ -207,24 +208,56 @@ def _iter_elements(soup):
     return soup.find_all(tags)
 
 
+def _is_toc_context(el, txt):
+    """
+    判斷此標題命中是否落在目錄(TOC)區。涵蓋三種 TOC 格式：
+      1) 同行點點+頁碼（is_toc_line 已處理）
+      2) 標題行後緊接純頁碼（下一個兄弟/文字節點是純數字）
+      3) 標題後直接接頁碼數字（如 "...VOTING STOCK 16"）
+    """
+    if is_toc_line(txt):
+        return True
+    # 標題文字結尾就是頁碼（短標題 + 結尾 1-3 位數字，且整體很短）
+    if re.search(r"\b\d{1,3}$", txt) and len(txt) < 70:
+        # 但要排除真正章節標題剛好以數字結尾的罕見情況：TOC 條目通常後面馬上又是另一個 TOC 條目
+        return True
+    # 下一個文字節點是純頁碼
+    try:
+        nxt = el.find_next(string=True)
+        if nxt and re.fullmatch(r"\s*\d{1,3}\s*", str(nxt)):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def find_section_start(soup):
     """
     定位受益所有權章節起點。
     錨點A（標題優先）：命中 OWNERSHIP_TITLE 且非 TOC 行的標題元素。
+        同一份文件中標題常出現兩次（目錄 + 正文），錨「最後一次」非 TOC 命中，
+        因為正文章節永遠在目錄之後 —— 即使 TOC 偵測漏判也能選到正文。
     錨點B（內容備援）：含「Beneficially Owned」字樣的表頭。
     回傳 (anchor_element, anchor_type) 或 (None, None)。
     """
-    # 錨點A：標題。跳過 TOC 行（後接點點+頁碼）與過長段落。
+    candidates = []
     for el in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6",
                              "b", "strong", "p", "font", "span", "div", "td"]):
         txt = el.get_text(" ", strip=True)
         if not txt or len(txt) > 120:
             continue
-        if OWNERSHIP_TITLE.search(txt) and not is_toc_line(txt):
-            # 排除「Section 16(a) Beneficial Ownership Reporting Compliance」這種非持股章節
-            if re.search(r"reporting compliance|section\s*16", txt, re.I):
-                continue
-            return el, "title"
+        if not OWNERSHIP_TITLE.search(txt):
+            continue
+        # 排除 Section 16(a) Beneficial Ownership Reporting Compliance（非持股章節）
+        if re.search(r"reporting compliance|section\s*16", txt, re.I):
+            continue
+        if _is_toc_context(el, txt):
+            continue
+        candidates.append(el)
+
+    if candidates:
+        # 錨最後一次非 TOC 命中（正文那個）
+        return candidates[-1], "title"
 
     # 錨點B：表頭。找第一張含 Beneficially Owned 的 table。
     for t in soup.find_all("table"):
@@ -236,16 +269,21 @@ def find_section_start(soup):
 
 def collect_section_blocks(anchor):
     """
-    從錨點往下，依文件順序收集連續的 table 與其間的附註文字，
+    從錨點往下，依文件順序收集連續的 table 與其間/其後的附註文字，
     直到掃到下一個大章節標題（STOP_HEADING）或超出步數上限。
     回傳 (tables_html:list, body_text:str)。
+
+    附註處理：受益所有權表後常接 (1)(2)... 編號附註（質押資訊多在此）。
+    這些附註可能是獨立 <p> 或獨立小 <table>，必須一併收進來，
+    且不可因附註中含 STOP_HEADING 字樣（如 "transactions"）而誤停。
     """
     tables_html = []
     text_chunks = []
     node = anchor
     steps = 0
-    seen_table = False
-    while node is not None and steps < 120:
+    collected = 0          # 已收集的文字/表格塊數，用來確認已離開標題本身
+    FOOTNOTE = re.compile(r"^\(?\s*(?:\d{1,3}|[a-z]|\*)\s*\)")  # (1) / (a) / *
+    while node is not None and steps < 200:
         node = node.find_next()
         if node is None:
             break
@@ -255,52 +293,169 @@ def collect_section_blocks(anchor):
         if name == "table":
             tables_html.append(str(node))
             text_chunks.append(normalize(node.get_text("\n", strip=True)))
-            seen_table = True
+            collected += 1
             continue
 
         # 只看葉節點文字，避免父容器重複計入
-        if name in ("p", "div", "span", "font", "li"):
+        if name in ("p", "div", "span", "font", "li", "td"):
             if node.find(["p", "div", "table", "span", "font", "li"]):
                 continue
             txt = normalize(node.get_text(" ", strip=True))
             if not txt:
                 continue
-            # 已經看過表格後，碰到下一個大章節標題就停
-            if seen_table and len(txt) < 120 and STOP_HEADING.match(txt) \
+            # 附註行（(1)(a)* 起頭）一律收進來，不視為章節結束
+            if FOOTNOTE.match(txt):
+                text_chunks.append(txt)
+                collected += 1
+                continue
+            # 已收集過內容後，碰到下一個大章節標題就停
+            if collected > 0 and len(txt) < 120 and STOP_HEADING.match(txt) \
                     and not is_toc_line(txt):
                 break
             text_chunks.append(txt)
+            collected += 1
 
     return tables_html, "\n".join(c for c in text_chunks if c)
 
 
+def extract_text_section(soup):
+    """
+    文字流截取（主路徑）：從正文（非 TOC）的受益所有權標題，
+    截到下一個大章節標題（STOP_HEADING）為止，回傳整段純文字。
+    這是最穩的邊界方案：不管附註是獨立 table、獨立 p、或被分頁符打斷，
+    只要落在「標題」與「下一個大章節」之間就一定被涵蓋（質押附註必在內）。
+    回傳 (section_text:str, found:bool)。
+    """
+    full = normalize(soup.get_text("\n"))
+    lines = [ln.strip() for ln in full.split("\n")]
+
+    # 收集所有「可能是標題」的候選行（通過 TOC/附註/完整句排除）。
+    candidates = []
+    for idx, ln in enumerate(lines):
+        if not ln or len(ln) > 90:
+            continue
+        if not OWNERSHIP_TITLE.search(ln):
+            continue
+        if re.search(r"reporting compliance|section\s*16", ln, re.I):
+            continue
+        if is_toc_line(ln) or (re.search(r"\b\d{1,3}$", ln) and len(ln) < 70):
+            continue
+        if re.match(r"^\(?\s*(?:\d{1,3}|[a-z]|\*)\s*\)", ln):
+            continue
+        if ln.rstrip().endswith(".") or re.search(
+                r"\b(?:set forth|based (?:solely )?on|consists of|includes)\b", ln, re.I):
+            continue
+        candidates.append(idx)
+
+    if not candidates:
+        return "", False
+
+    def _extract_from(start):
+        out, seen = [], 0
+        for ln in lines[start + 1: start + 1 + 600]:
+            if not ln:
+                continue
+            if re.match(r"^\(?\s*(?:\d{1,3}|[a-z]|\*)\s*\)", ln):
+                out.append(ln); seen += 1; continue
+            if seen > 0 and len(ln) < 120 and STOP_HEADING.match(ln) and not is_toc_line(ln):
+                break
+            if re.fullmatch(r"\d{1,3}", ln) or re.match(r"TABLE OF CONTENTS", ln, re.I):
+                continue
+            out.append(ln); seen += 1
+        return "\n".join(out)
+
+    # 錨點驗證 + 評分：受益所有權章節的鐵特徵是
+    #   (a) 含表頭字樣 "Beneficially Owned" / "Amount and Nature of Beneficial"
+    #   (b) 短距內出現多個「股數/百分比」樣式（持股列）
+    # 文件尾段（proxy 雜燴）可能夠長且含零星數字，但不會有表頭字樣 → 用表頭區分真假。
+    SHARE_PAT = re.compile(r"\d{1,3}(?:,\d{3})+|\d+\.\d+\s*%|\b\d{1,2}\s*%")
+    HDR = re.compile(r"beneficially owned|amount and nature of beneficial"
+                     r"|number of shares|percent of class|% of class", re.I)
+
+    def _score(sec):
+        if len(sec) < 150:
+            return -1
+        n_share = len(SHARE_PAT.findall(sec))
+        has_hdr = bool(HDR.search(sec))
+        if n_share < 2:                 # 至少要有兩個股數/百分比（多筆持股列）
+            return -1
+        # 有表頭 → 高分；無表頭但多股數 → 中分（仍可能是純文字持股表如 .txt）
+        return (100 if has_hdr else 10) + min(n_share, 50)
+
+    scored = []
+    for start in candidates:
+        sec = _extract_from(start)
+        sc = _score(sec)
+        if sc > 0:
+            scored.append((sc, len(sec), sec))
+
+    if scored:
+        # 取分數最高者；同分取較長（資訊較完整）
+        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        return scored[0][2], True
+
+    # 全部候選都不像持股表時，回最長的候選（至少不空手）
+    best = ""
+    for start in candidates:
+        sec = _extract_from(start)
+        if len(sec) > len(best):
+            best = sec
+    return best, bool(best)
+
+
+def collect_tables_in_text_range(soup, section_text):
+    """
+    輔助：保留落在章節文字範圍內的 HTML table（給步驟2結構化用）。
+    判準：table 的純文字內容大部分出現在 section_text 裡。
+    """
+    if not section_text:
+        return ""
+    kept = []
+    sec_norm = re.sub(r"\s+", "", section_text)
+    for t in soup.find_all("table"):
+        tt = re.sub(r"\s+", "", normalize(t.get_text(" ", strip=True)))
+        if len(tt) < 20:
+            continue
+        # 取 table 前 60 字當指紋，看是否落在章節文字內
+        fp = tt[:60]
+        if fp and fp in sec_norm:
+            kept.append(str(t))
+    return "\n".join(kept)
+
+
 def step1_extract_section(record, htmltxt):
     """
-    回傳 dict：含截取到的受益所有權章節（合併相鄰小表 + 附註文字）、是否含質押。
+    回傳 dict：含截取到的受益所有權章節（文字流為主 + 範圍內 HTML table）、是否含質押。
     這份輸出就是要餵給步驟 2/3 AI 的原料。
     """
     soup = soup_from(htmltxt)
 
-    anchor, anchor_type = find_section_start(soup)
+    # 主路徑：文字流截取章節（保證附註/質押在內）
+    section_text, found = extract_text_section(soup)
 
     sections = []
-    section_text = ""
-    if anchor is not None:
-        tables_html, section_text = collect_section_blocks(anchor)
-        if tables_html or section_text:
-            sections.append({
-                "anchor_type": anchor_type,            # title / header
-                "table_text":  "\n".join(
-                    normalize(BeautifulSoup(h, "lxml").get_text("\n", strip=True))
-                    for h in tables_html),
-                "table_html":  "\n".join(tables_html),  # 合併後的整段表格 HTML
-                "footnotes":   section_text,            # 章節內文字（含附註）
-            })
+    anchor_type = None
+    if found and section_text:
+        anchor_type = "text"
+        table_html = collect_tables_in_text_range(soup, section_text)
+        sections.append({
+            "anchor_type": "text",
+            "table_text":  section_text,    # 章節全文（含表格資料與附註）
+            "table_html":  table_html,      # 範圍內保留的 HTML table（輔助結構）
+            "footnotes":   section_text,
+        })
 
-    # has_pledge 獨立判斷：對「章節文字」整段跑，不再依賴表格是否抓到。
-    # 若連章節都沒定位到，退回對全文判斷（避免 FSP 那種漏標）。
-    pledge_scope = section_text or normalize(soup.get_text(" "))
-    has_pledge = bool(PLEDGE_KW.search(pledge_scope))
+    # has_pledge 固定對全文判斷（與章節定位脫鉤）。
+    # 理由：質押揭露常在「關聯交易」段、不在持股表章節內；漏抓比誤抓嚴重。
+    full_text = normalize(soup.get_text(" "))
+    pledge_in_full = bool(PLEDGE_KW.search(full_text))
+    pledge_in_section = bool(PLEDGE_KW.search(section_text)) if section_text else False
+    if pledge_in_section:
+        pledge_loc = "in_section"
+    elif pledge_in_full:
+        pledge_loc = "out_of_section"
+    else:
+        pledge_loc = "none"
 
     return {
         "CIK":          record["CIK"],
@@ -309,7 +464,8 @@ def step1_extract_section(record, htmltxt):
         "anchor_type":  anchor_type,         # 用哪個錨點定位到的（None=失敗）
         "n_tables":     len(sections),
         "sections":     sections,
-        "has_pledge":   has_pledge,          # ← 步驟2/3 分流依據
+        "has_pledge":   pledge_in_full,      # ← 步驟2/3 分流依據（全文判斷）
+        "pledge_loc":   pledge_loc,          # in_section / out_of_section / none
     }
 
 
@@ -459,6 +615,8 @@ def main():
             fout.write(json.dumps(section, ensure_ascii=False) + "\n")
 
             tag = "有質押" if section["has_pledge"] else "無質押"
+            if section["pledge_loc"] == "out_of_section":
+                tag += "(章節外)"
             anc = section["anchor_type"] or "未定位"
             print(f"  [{i}] CIK={rec['CIK']} 錨點={anc} 區塊={section['n_tables']} {tag}")
 
