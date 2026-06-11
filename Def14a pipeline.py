@@ -191,19 +191,30 @@ def soup_from(htmltxt):
 # 步驟 0：掃描清單上的 DEF 14A filings
 # ============================================================
 def step0_load_list(path=INPUT_XLSX, limit=LIMIT):
-    """讀入清單（CIK, FILEDATE, http），回傳 list[dict]。"""
+    """
+    讀入清單，以 http（文件 URL）為單位去重，回傳 list[dict]。
+    為何用 http 去重：一份 filing 由 URL 唯一識別。清單裡同一份 filing 會
+    因「多個內部人各佔一列」而重複出現（同 CIK+FILEDATE），但那是同一份文件，
+    只需抓一次、AI 一次回傳所有質押人。用 CIK|FILEDATE 去重則會誤刪
+    「同公司同日但不同文件」的情況（實測 3063 vs 3064，有 1 筆差異）。
+    """
     df = pd.read_excel(path, dtype=str).fillna("")
-    # 容錯：欄名大小寫/別名
     cols = {c.lower().strip(): c for c in df.columns}
     cik_c  = cols.get("cik")
     date_c = cols.get("filedate") or cols.get("file_date") or cols.get("date")
     url_c  = cols.get("http") or cols.get("url") or cols.get("link")
+
     records = []
+    seen_http = set()
     for _, row in df.iterrows():
+        http = str(row[url_c]).strip()
+        if not http or http in seen_http:
+            continue                      # 以 http 去重：同一份 filing 只留一筆
+        seen_http.add(http)
         records.append({
             "CIK":      str(row[cik_c]).strip(),
             "FILEDATE": str(row[date_c]).strip(),
-            "http":     str(row[url_c]).strip(),
+            "http":     http,
         })
     if limit:
         records = records[:limit]
@@ -358,22 +369,36 @@ def extract_text_section(soup):
     lines = [ln.strip() for ln in full.split("\n")]
 
     # 收集所有「可能是標題」的候選行（通過 TOC/附註/完整句排除）。
+    # 標題可能被換行拆成相鄰多行（如 "Principal" / "Shareholders"），
+    # 故同時比對「單行」與「相鄰 2-3 行合併」後是否命中標題。
+    def _merged(idx, span):
+        return " ".join(lines[idx:idx + span]).strip()
+
     candidates = []
     for idx, ln in enumerate(lines):
-        if not ln or len(ln) > 90:
+        if not ln:
             continue
-        if not OWNERSHIP_TITLE.search(ln):
+        # 嘗試單行、+下一行、+下兩行；取第一個命中標題的合併字串
+        hit_text = None
+        for span in (1, 2, 3):
+            cand_text = _merged(idx, span)
+            if len(cand_text) > 90:
+                break
+            if OWNERSHIP_TITLE.search(cand_text):
+                hit_text = cand_text
+                break
+        if hit_text is None:
             continue
-        if re.search(r"reporting compliance|section\s*16", ln, re.I):
+        if re.search(r"reporting compliance|section\s*16", hit_text, re.I):
             continue
-        if is_toc_line(ln) or (re.search(r"\b\d{1,3}$", ln) and len(ln) < 70):
+        if is_toc_line(hit_text) or (re.search(r"\b\d{1,3}$", hit_text) and len(hit_text) < 70):
             continue
-        if re.match(r"^\(?\s*(?:\d{1,3}|[a-z]|\*)\s*\)", ln):
+        if re.match(r"^\(?\s*(?:\d{1,3}|[a-z]|\*)\s*\)", hit_text):
             continue
-        if ln.rstrip().endswith(".") or re.search(
-                r"\b(?:set forth|based (?:solely )?on|consists of|includes)\b", ln, re.I):
+        if hit_text.rstrip().endswith(".") or re.search(
+                r"\b(?:set forth|based (?:solely )?on|consists of|includes)\b", hit_text, re.I):
             continue
-        candidates.append(idx)
+        candidates.append((idx, hit_text))
 
     if not candidates:
         return "", False
@@ -392,42 +417,58 @@ def extract_text_section(soup):
             out.append(ln); seen += 1
         return "\n".join(out)
 
-    # 錨點驗證 + 評分：受益所有權章節的鐵特徵是
-    #   (a) 含表頭字樣 "Beneficially Owned" / "Amount and Nature of Beneficial"
-    #   (b) 短距內出現多個「股數/百分比」樣式（持股列）
-    # 文件尾段（proxy 雜燴）可能夠長且含零星數字，但不會有表頭字樣 → 用表頭區分真假。
+    # 錨點評分（以「標題」為主、內容為輔）：
+    # 受益所有權揭露常分「內部人(董事/高管)表」與「5% 機構大股東表」兩段。
+    # 質押是內部人做的，故主依據是「標題是否指向內部人表」——這比從截出內容
+    # 猜測可靠（截出範圍可能過大而使內容特徵失真）。
     SHARE_PAT = re.compile(r"\d{1,3}(?:,\d{3})+|\d+\.\d+\s*%|\b\d{1,2}\s*%")
     HDR = re.compile(r"beneficially owned|amount and nature of beneficial"
                      r"|number of shares|percent of class|% of class", re.I)
+    PLEDGE_LOCAL = re.compile(r"\bpledg(?:e|ed|es|ing)\b|as collateral|as security", re.I)
+    # 標題明確指向內部人持股表 → 強加分
+    TITLE_INSIDER = re.compile(
+        r"directors? and (?:executive |named )?officers"
+        r"|by (?:directors|management)|management ownership"
+        r"|security ownership of (?:management|directors)"
+        r"|ownership of (?:directors|management)"
+        r"|directors,? (?:nominees|executive)", re.I)
+    # 標題指向「非持股表」的雜訊（持股政策、投票說明） → 強扣分
+    TITLE_NOISE = re.compile(
+        r"ownership guidelines|how (?:to vote|your shares)|voting (?:procedures|instruction)"
+        r"|share ownership is|recorded", re.I)
 
-    def _score(sec):
+    def _score(sec, title):
         if len(sec) < 150:
-            return -1
+            return -100
         n_share = len(SHARE_PAT.findall(sec))
-        has_hdr = bool(HDR.search(sec))
         if n_share < 2:                 # 至少要有兩個股數/百分比（多筆持股列）
-            return -1
-        # 有表頭 → 高分；無表頭但多股數 → 中分（仍可能是純文字持股表如 .txt）
-        return (100 if has_hdr else 10) + min(n_share, 50)
+            return -100
+        score = (100 if HDR.search(sec) else 10) + min(n_share, 50)
+        # 標題訊號（主依據）
+        if TITLE_INSIDER.search(title):
+            score += 200               # 標題明說是董事/高管表 → 強烈優先
+        if TITLE_NOISE.search(title):
+            score -= 200               # 標題是持股政策/投票說明 → 強烈排除
+        # 內容輔助：質押字樣出現 → 這段就是我們要的（質押在內部人表）
+        if PLEDGE_LOCAL.search(sec):
+            score += 80
+        # 內容輔助：截出過長（>15000字）多半範圍失控，輕微扣分
+        if len(sec) > 15000:
+            score -= 40
+        return score
 
     scored = []
-    for start in candidates:
-        sec = _extract_from(start)
-        sc = _score(sec)
-        if sc > 0:
-            scored.append((sc, len(sec), sec))
+    for idx, title in candidates:
+        sec = _extract_from(idx)
+        sc = _score(sec, title)
+        scored.append((sc, len(sec), sec))
 
-    if scored:
-        # 取分數最高者；同分取較長（資訊較完整）
-        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    scored.sort(key=lambda x: (x[0], -x[1]), reverse=True)  # 高分優先；同分取較短(較精準)
+    if scored and scored[0][0] > 0:
         return scored[0][2], True
 
     # 全部候選都不像持股表時，回最長的候選（至少不空手）
-    best = ""
-    for start in candidates:
-        sec = _extract_from(start)
-        if len(sec) > len(best):
-            best = sec
+    best = max((s[2] for s in scored), key=len, default="")
     return best, bool(best)
 
 
@@ -485,6 +526,10 @@ def step1_extract_section(record, htmltxt):
     else:
         pledge_loc = "none"
 
+    # 信心評估：程式自己能判斷的可靠度訊號，供人工複查篩選。
+    confidence, reasons = _assess_confidence(
+        section_text, found, pledge_in_full, pledge_in_section)
+
     return {
         "CIK":          record["CIK"],
         "FILEDATE":     record["FILEDATE"],
@@ -494,7 +539,48 @@ def step1_extract_section(record, htmltxt):
         "sections":     sections,
         "has_pledge":   pledge_in_full,      # ← 步驟2/3 分流依據（全文判斷）
         "pledge_loc":   pledge_loc,          # in_section / out_of_section / none
+        "confidence":   confidence,          # high / medium / low
+        "review_reason": "; ".join(reasons), # 低信心原因（供 needs_review）
     }
+
+
+# 信心評估用的訊號
+_INSIDER_TITLE = re.compile(
+    r"directors? and (?:executive |named )?officers|by (?:directors|management)"
+    r"|management ownership|security ownership of (?:management|directors)"
+    r"|ownership of (?:directors|management)", re.I)
+_INST_ONLY = re.compile(r"the following institutions|more than (?:five|5)\s*(?:percent|%)", re.I)
+
+
+def _assess_confidence(section_text, found, pledge_in_full, pledge_in_section):
+    """
+    回傳 (confidence, reasons)。判斷依據：
+      - 章節是否定位到、長度是否正常
+      - 是否抓到內部人持股表（vs 只抓到機構大股東表）
+      - has_pledge=True 但質押不在截取的章節內（可能餵 AI 的原料缺質押）
+    """
+    reasons = []
+    if not found or not section_text:
+        return "low", ["章節未定位"]
+    n = len(section_text)
+    if n < 300:
+        reasons.append(f"章節過短({n}字)")
+    if n > 18000:
+        reasons.append(f"章節過長({n}字，可能範圍失控)")
+    # 抓到內部人表特徵？（質押人必為內部人）
+    has_insider = bool(_INSIDER_TITLE.search(section_text)) or \
+        bool(re.search(r"all directors and executive officers|as a group", section_text, re.I))
+    looks_institutional = bool(_INST_ONLY.search(section_text))
+    if not has_insider and looks_institutional:
+        reasons.append("疑似只抓到機構大股東表，非內部人表")
+    # has_pledge 但質押不在章節原料內 → 餵 AI 的原料可能缺質押
+    if pledge_in_full and not pledge_in_section:
+        reasons.append("質押在章節外，AI 原料可能漏質押")
+    if reasons:
+        # 僅長度偏短/偏長算 medium；涉及抓錯表或漏質押算 low
+        severe = any(("機構" in r or "漏質押" in r or "未定位" in r) for r in reasons)
+        return ("low" if severe else "medium"), reasons
+    return "high", []
 
 
 # ============================================================
@@ -815,18 +901,19 @@ def main():
     if FRESH:
         print("[FRESH] 忽略舊進度檔，全部重跑")
     no_pledge, pledged = [], []
-    # 留存每筆的 section 與 htmltxt（步驟4 查職位需要全文）
     sections_all = []
+    failed_fetch = []          # 抓取失敗的 filing，供之後重試
 
     with open(OUTPUT_SECTIONS, "w" if FRESH else "a", encoding="utf-8") as fout:
         for i, rec in enumerate(records, 1):
-            key = f"{rec['CIK']}|{rec['FILEDATE']}"
+            key = rec["http"]            # 以 http 為唯一鍵（斷點續跑用）
             if key in done:
                 continue
 
             htmltxt = fetch(rec["http"])
             if not htmltxt:
                 print(f"  [{i}] 抓取失敗 CIK={rec['CIK']}")
+                failed_fetch.append(rec)
                 done.add(key)
                 continue
 
@@ -842,7 +929,9 @@ def main():
             if section["pledge_loc"] == "out_of_section":
                 tag += "(章節外)"
             anc = section["anchor_type"] or "未定位"
-            print(f"  [{i}] CIK={rec['CIK']} 錨點={anc} 區塊={section['n_tables']} {tag}")
+            conf = section["confidence"]
+            mark = {"high": "", "medium": " ⚠", "low": " ‼"}[conf]
+            print(f"  [{i}] CIK={rec['CIK']} 錨點={anc} {tag} 信心={conf}{mark}")
 
             (pledged if section["has_pledge"] else no_pledge).append(section)
             sections_all.append((section, htmltxt))
@@ -853,7 +942,28 @@ def main():
             time.sleep(SLEEP)
 
     save_progress(done)
-    print(f"\n[彙總] 無質押 {len(no_pledge)} 家、有質押 {len(pledged)} 家")
+
+    # 信心統計 + 待複查清單
+    conf_counts = {"high": 0, "medium": 0, "low": 0}
+    review_rows = []
+    for sec, _ in sections_all:
+        conf_counts[sec["confidence"]] += 1
+        if sec["confidence"] != "high":
+            review_rows.append({
+                "CIK": sec["CIK"], "FILEDATE": sec["FILEDATE"], "http": sec["http"],
+                "confidence": sec["confidence"], "reason": sec["review_reason"],
+            })
+    for rec in failed_fetch:
+        review_rows.append({
+            "CIK": rec["CIK"], "FILEDATE": rec["FILEDATE"], "http": rec["http"],
+            "confidence": "low", "reason": "抓取失敗（需重試）"})
+
+    print(f"\n[彙總] 無質押 {len(no_pledge)} 家、有質押 {len(pledged)} 家、抓取失敗 {len(failed_fetch)} 筆")
+    print(f"[信心] high={conf_counts['high']} medium={conf_counts['medium']} low={conf_counts['low']}")
+    if review_rows:
+        _write_csv("needs_review.csv", review_rows,
+                   ["CIK", "FILEDATE", "http", "confidence", "reason"])
+        print(f"[待複查] {len(review_rows)} 筆寫入 needs_review.csv（medium/low/抓取失敗）")
     print("步驟1 截取結果已寫入：", OUTPUT_SECTIONS)
 
     if not RUN_AI:
