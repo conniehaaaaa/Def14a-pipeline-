@@ -60,7 +60,7 @@ USER_AGENT = "WenZhi Research yizhen1426@gmail.com"
 
 # --- AI（步驟 2/3）設定 ---
 RUN_AI       = True       # False = 只做步驟0/1（截取章節），不呼叫 AI
-AI_TEST_MODE = True       # True = 只跑第 1 筆並印出「送什麼/收什麼」，驗證 prompt 與 schema；
+AI_TEST_MODE = False       # True = 只跑第 1 筆並印出「送什麼/收什麼」，驗證 prompt 與 schema；
                           #        驗證 OK 後改 False 全自動跑全部
 OPENAI_MODEL = "gpt-5"    # 模型名稱（請依實際可用模型調整，如 gpt-4o 等）
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"   # 從環境變數讀 key（勿把 key 寫進程式）
@@ -559,9 +559,13 @@ def call_openai(section_text, base_prompt):
              "Output strictly valid JSON per the user's schema."},
             {"role": "user", "content": user_content},
         ],
-        "temperature": AI_TEMPERATURE,
-        "max_tokens": AI_MAX_TOKENS,
+        "max_completion_tokens": AI_MAX_TOKENS,
     }
+    # 較舊模型（gpt-4o 等）用 max_tokens 且支援 temperature；
+    # 較新模型（gpt-5 系列）用 max_completion_tokens 且 temperature 固定為預設值。
+    if not OPENAI_MODEL.startswith(("gpt-5", "o1", "o3", "o4")):
+        payload["max_tokens"] = payload.pop("max_completion_tokens")
+        payload["temperature"] = AI_TEMPERATURE
     headers = {"Authorization": f"Bearer {_openai_key()}",
                "Content-Type": "application/json"}
     for attempt in range(RETRIES):
