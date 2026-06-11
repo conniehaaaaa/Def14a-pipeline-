@@ -27,9 +27,16 @@ import re
 import time
 import json
 import html
+import warnings
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
+
+try:
+    from bs4 import XMLParsedAsHTMLWarning
+    warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+except ImportError:
+    pass
 
 # 載入 .env（若有安裝 python-dotenv）；找專案根目錄的 .env
 try:
@@ -60,11 +67,11 @@ USER_AGENT = "WenZhi Research yizhen1426@gmail.com"
 
 # --- AI（步驟 2/3）設定 ---
 RUN_AI       = True       # False = 只做步驟0/1（截取章節），不呼叫 AI
-AI_TEST_MODE = False       # True = 只跑第 1 筆並印出「送什麼/收什麼」，驗證 prompt 與 schema；
+AI_TEST_MODE = False      # True = 只跑第 1 筆並印出「送什麼/收什麼」，驗證 prompt 與 schema；
                           #        驗證 OK 後改 False 全自動跑全部
 OPENAI_MODEL = "gpt-5"    # 模型名稱（請依實際可用模型調整，如 gpt-4o 等）
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"   # 從環境變數讀 key（勿把 key 寫進程式）
-AI_MAX_TOKENS = 1500
+AI_MAX_TOKENS = 8000      # 上限：GPT-5 系列會先用 token 做內部推理，需留足額度避免答案被截斷
 AI_TEMPERATURE = 0        # 抽取任務要穩定、可重現，溫度設 0
 AI_SLEEP     = 0.5        # 連續呼叫 API 的間隔
 
@@ -519,13 +526,15 @@ Return ONLY a valid JSON object, no prose, no markdown fences. Use this exact sc
     {"share_class": "Common" or class name, "shares": number or null}
   ],
   "pledges": [
-    {"insider_name": "...", "share_class": "Common" or class name,
+    {"insider_name": "...", "title": "person's role at the company, e.g. President, CFO, Director",
+     "share_class": "Common" or class name,
      "pledged_shares": number or null, "shares_owned": number or null}
   ]
 }
 Rules:
 - If single share class, use "Common" as share_class and one entry in aggregate_insider_ownership.
 - If no pledges are found, "pledges" must be an empty list [].
+- For "title", use the person's role as stated in the filing (director, officer title, etc.); use null if not stated.
 - Use plain integers for share counts (no commas). Use null if a value is not stated.
 - Do not invent data; only report what the text supports.
 """
@@ -573,7 +582,21 @@ def call_openai(section_text, base_prompt):
             r = requests.post("https://api.openai.com/v1/chat/completions",
                               headers=headers, json=payload, timeout=60)
             if r.status_code == 200:
-                content = r.json()["choices"][0]["message"]["content"]
+                data = r.json()
+                choice = data.get("choices", [{}])[0]
+                content = choice.get("message", {}).get("content", "")
+                finish = choice.get("finish_reason", "")
+                if not content or not content.strip():
+                    # 空回傳：多半是答案被截斷（length）或內容過濾。印出診斷。
+                    usage = data.get("usage", {})
+                    print(f"    [AI] 空回傳 finish_reason={finish} usage={usage}")
+                    if finish == "length":
+                        print("    [AI] → 被 token 上限截斷，請調高 AI_MAX_TOKENS")
+                    # length 截斷時重試一次（已調高上限的話通常下次就過）
+                    if finish == "length" and attempt < RETRIES - 1:
+                        time.sleep(1)
+                        continue
+                    return None
                 return _parse_json(content)
             if r.status_code in (429, 500, 502, 503):
                 time.sleep(2 * (attempt + 1))
@@ -668,7 +691,7 @@ def step3_pledges(section):
             "share_class":   p.get("share_class"),
             "pledged_shares": p.get("pledged_shares"),
             "shares_owned":  p.get("shares_owned"),
-            "title":         "",     # 步驟4 回填
+            "title":         (p.get("title") or "").strip(),  # AI 直接回傳；空則步驟4備援
         })
     return agg_rows, pledge_rows
 
@@ -857,9 +880,10 @@ def main():
                 print("\n===== Prompt =====")
                 print(PROMPT_STEP3[:200] + " ...")
             a_rows, p_rows = step3_pledges(sec)
-            # 步驟4：回填質押人職位
+            # 步驟4：AI 已直接回傳職位；僅當 AI 沒給時，才用爬蟲從全文備援
             for pr in p_rows:
-                pr["title"] = step4_lookup_title(pr["CIK"], pr["insider_name"], htmltxt)
+                if not pr.get("title"):
+                    pr["title"] = step4_lookup_title(pr["CIK"], pr["insider_name"], htmltxt)
             agg_rows += a_rows
             pledge_rows += p_rows
             if AI_TEST_MODE:
