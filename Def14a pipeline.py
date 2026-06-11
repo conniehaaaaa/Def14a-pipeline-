@@ -67,7 +67,7 @@ USER_AGENT = "WenZhi Research yizhen1426@gmail.com"
 
 # --- AI（步驟 2/3）設定 ---
 RUN_AI       = True       # False = 只做步驟0/1（截取章節），不呼叫 AI
-AI_TEST_MODE = False      # True = 只跑第 1 筆並印出「送什麼/收什麼」，驗證 prompt 與 schema；
+AI_TEST_MODE = True     # True = 只跑第 1 筆並印出「送什麼/收什麼」，驗證 prompt 與 schema；
                           #        驗證 OK 後改 False 全自動跑全部
 OPENAI_MODEL = "gpt-5"    # 模型名稱（請依實際可用模型調整，如 gpt-4o 等）
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"   # 從環境變數讀 key（勿把 key 寫進程式）
