@@ -1,1 +1,23 @@
 *.xlsx
+# 機密：API key 等
+.env
+
+# 執行階段產物
+pipeline_progress.json
+step1_sections.jsonl
+step2_owners.csv
+step3_pledges.csv
+step3_aggregate.csv
+step4_titles.csv
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 編輯器 / 系統
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
